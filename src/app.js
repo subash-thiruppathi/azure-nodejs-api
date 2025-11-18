@@ -1,6 +1,7 @@
 const express = require('express');
 const multer = require('multer');
 const storageService = require('./storageService');
+const databaseService = require('./databaseService');
 
 const app = express();
 
@@ -11,7 +12,6 @@ const upload = multer({
     fileSize: 10 * 1024 * 1024, // 10MB limit
   },
   fileFilter: (req, file, cb) => {
-    // Allow images, PDFs, and text files
     const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'application/pdf', 'text/plain'];
     if (allowedTypes.includes(file.mimetype)) {
       cb(null, true);
@@ -26,7 +26,6 @@ app.use(express.json());
 // Get environment variables
 const API_VERSION = process.env.API_VERSION || '1.0.0';
 const ENVIRONMENT = process.env.ENVIRONMENT || 'development';
-const MAX_TASKS = parseInt(process.env.MAX_TASKS) || 10;
 
 // Get Application Insights client
 let appInsights;
@@ -36,9 +35,15 @@ try {
   console.log('Application Insights not available');
 }
 
+// Initialize database tables on startup
+if (databaseService.isConfigured) {
+  databaseService.initializeTables().catch(err => {
+    console.error('Failed to initialize database tables:', err);
+  });
+}
+
 // Health check endpoint
 app.get('/api/health', (req, res) => {
-  // Track custom event
   if (appInsights && appInsights.defaultClient) {
     appInsights.defaultClient.trackEvent({
       name: 'HealthCheckCalled',
@@ -55,69 +60,220 @@ app.get('/api/health', (req, res) => {
     environment: ENVIRONMENT,
     version: API_VERSION,
     monitoring: appInsights && appInsights.defaultClient ? 'enabled' : 'disabled',
-    storage: storageService.isConfigured ? 'enabled' : 'disabled'
+    storage: storageService.isConfigured ? 'enabled' : 'disabled',
+    database: databaseService.isConfigured ? 'enabled' : 'disabled'
   });
 });
 
-// Get all tasks (limited by MAX_TASKS)
-app.get('/api/tasks', (req, res) => {
-  const startTime = Date.now();
-  
-  const allTasks = [
-    { id: 1, title: 'Learn Azure App Service', completed: true },
-    { id: 2, title: 'Deploy to Azure', completed: true },
-    { id: 3, title: 'Master DevOps', completed: false },
-    { id: 4, title: 'Configure Environment Variables', completed: true },
-    { id: 5, title: 'Add Application Insights', completed: true }
-  ];
-  
-  // Limit tasks based on MAX_TASKS environment variable
-  const tasks = allTasks.slice(0, MAX_TASKS);
-  
-  // Track custom metric
-  if (appInsights && appInsights.defaultClient) {
-    const duration = Date.now() - startTime;
-    appInsights.defaultClient.trackMetric({
-      name: 'TasksRetrievalTime',
-      value: duration
+// ==================== DATABASE TASK ENDPOINTS ====================
+
+// Get all tasks from database
+app.get('/api/db/tasks', async (req, res) => {
+  try {
+    if (!databaseService.isConfigured) {
+      return res.status(503).json({ 
+        error: 'Database not configured',
+        message: 'DATABASE_URL environment variable is missing'
+      });
+    }
+
+    const tasks = await databaseService.getAllTasks();
+
+    if (appInsights && appInsights.defaultClient) {
+      appInsights.defaultClient.trackEvent({
+        name: 'DatabaseTasksRetrieved',
+        properties: { count: tasks.length }
+      });
+    }
+
+    res.json({
+      success: true,
+      count: tasks.length,
+      tasks: tasks
     });
+
+  } catch (error) {
+    console.error('Get tasks error:', error);
     
-    appInsights.defaultClient.trackEvent({
-      name: 'TasksRetrieved',
-      properties: {
-        count: tasks.length,
-        maxAllowed: MAX_TASKS
-      }
+    if (appInsights && appInsights.defaultClient) {
+      appInsights.defaultClient.trackException({ exception: error });
+    }
+
+    res.status(500).json({ 
+      error: 'Failed to retrieve tasks',
+      message: error.message 
     });
   }
-  
-  res.json({
-    tasks,
-    total: tasks.length,
-    maxAllowed: MAX_TASKS,
-    environment: ENVIRONMENT
-  });
 });
 
-// Get task by ID
-app.get('/api/tasks/:id', (req, res) => {
-  const taskId = parseInt(req.params.id);
-  
-  // Track the task ID being requested
-  if (appInsights && appInsights.defaultClient) {
-    appInsights.defaultClient.trackEvent({
-      name: 'TaskByIdRequested',
-      properties: {
-        taskId: taskId
-      }
+// Get single task by ID
+app.get('/api/db/tasks/:id', async (req, res) => {
+  try {
+    if (!databaseService.isConfigured) {
+      return res.status(503).json({ error: 'Database not configured' });
+    }
+
+    const task = await databaseService.getTaskById(req.params.id);
+
+    if (!task) {
+      return res.status(404).json({ 
+        error: 'Task not found',
+        id: req.params.id 
+      });
+    }
+
+    res.json({
+      success: true,
+      task: task
+    });
+
+  } catch (error) {
+    console.error('Get task error:', error);
+    res.status(500).json({ 
+      error: 'Failed to retrieve task',
+      message: error.message 
     });
   }
-  
-  const task = { id: taskId, title: `Task ${taskId}`, completed: false };
-  res.json(task);
 });
 
-// Upload file endpoint
+// Create new task
+app.post('/api/db/tasks', async (req, res) => {
+  try {
+    if (!databaseService.isConfigured) {
+      return res.status(503).json({ error: 'Database not configured' });
+    }
+
+    const { title, description } = req.body;
+
+    if (!title) {
+      return res.status(400).json({ 
+        error: 'Validation error',
+        message: 'Title is required' 
+      });
+    }
+
+    const task = await databaseService.createTask(title, description);
+
+    if (appInsights && appInsights.defaultClient) {
+      appInsights.defaultClient.trackEvent({
+        name: 'TaskCreated',
+        properties: { taskId: task.id }
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Task created successfully',
+      task: task
+    });
+
+  } catch (error) {
+    console.error('Create task error:', error);
+    
+    if (appInsights && appInsights.defaultClient) {
+      appInsights.defaultClient.trackException({ exception: error });
+    }
+
+    res.status(500).json({ 
+      error: 'Failed to create task',
+      message: error.message 
+    });
+  }
+});
+
+// Update task
+app.put('/api/db/tasks/:id', async (req, res) => {
+  try {
+    if (!databaseService.isConfigured) {
+      return res.status(503).json({ error: 'Database not configured' });
+    }
+
+    const { title, description, completed } = req.body;
+    const id = req.params.id;
+
+    if (!title) {
+      return res.status(400).json({ 
+        error: 'Validation error',
+        message: 'Title is required' 
+      });
+    }
+
+    const task = await databaseService.updateTask(
+      id, 
+      title, 
+      description || '', 
+      completed !== undefined ? completed : false
+    );
+
+    if (!task) {
+      return res.status(404).json({ 
+        error: 'Task not found',
+        id: id 
+      });
+    }
+
+    if (appInsights && appInsights.defaultClient) {
+      appInsights.defaultClient.trackEvent({
+        name: 'TaskUpdated',
+        properties: { taskId: task.id }
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Task updated successfully',
+      task: task
+    });
+
+  } catch (error) {
+    console.error('Update task error:', error);
+    res.status(500).json({ 
+      error: 'Failed to update task',
+      message: error.message 
+    });
+  }
+});
+
+// Delete task
+app.delete('/api/db/tasks/:id', async (req, res) => {
+  try {
+    if (!databaseService.isConfigured) {
+      return res.status(503).json({ error: 'Database not configured' });
+    }
+
+    const task = await databaseService.deleteTask(req.params.id);
+
+    if (!task) {
+      return res.status(404).json({ 
+        error: 'Task not found',
+        id: req.params.id 
+      });
+    }
+
+    if (appInsights && appInsights.defaultClient) {
+      appInsights.defaultClient.trackEvent({
+        name: 'TaskDeleted',
+        properties: { taskId: task.id }
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Task deleted successfully',
+      task: task
+    });
+
+  } catch (error) {
+    console.error('Delete task error:', error);
+    res.status(500).json({ 
+      error: 'Failed to delete task',
+      message: error.message 
+    });
+  }
+});
+
+// ==================== FILE UPLOAD ENDPOINTS ====================
+
 app.post('/api/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
@@ -131,10 +287,8 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
       });
     }
 
-    // Upload to Azure Blob Storage
     const result = await storageService.uploadFile(req.file);
 
-    // Track upload event
     if (appInsights && appInsights.defaultClient) {
       appInsights.defaultClient.trackEvent({
         name: 'FileUploaded',
@@ -155,7 +309,6 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   } catch (error) {
     console.error('Upload error:', error);
     
-    // Track error
     if (appInsights && appInsights.defaultClient) {
       appInsights.defaultClient.trackException({ exception: error });
     }
@@ -167,13 +320,10 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-// List all uploaded files
 app.get('/api/files', async (req, res) => {
   try {
     if (!storageService.isConfigured) {
-      return res.status(503).json({ 
-        error: 'Storage service not configured' 
-      });
+      return res.status(503).json({ error: 'Storage service not configured' });
     }
 
     const files = await storageService.listFiles();
@@ -193,20 +343,23 @@ app.get('/api/files', async (req, res) => {
   }
 });
 
-// Root endpoint
+// ==================== ROOT ENDPOINT ====================
+
 app.get('/', (req, res) => {
   res.json({
-    message: 'Azure Node.js API',
+    message: 'Azure Node.js API with PostgreSQL',
     version: API_VERSION,
     environment: ENVIRONMENT,
     endpoints: [
       '/api/health',
-      '/api/tasks',
+      '/api/db/tasks (GET, POST)',
+      '/api/db/tasks/:id (GET, PUT, DELETE)',
       '/api/upload (POST)',
       '/api/files'
     ],
     monitoring: appInsights && appInsights.defaultClient ? 'Application Insights enabled' : 'No monitoring',
-    storage: storageService.isConfigured ? 'Azure Blob Storage enabled' : 'Storage not configured'
+    storage: storageService.isConfigured ? 'Azure Blob Storage enabled' : 'Storage not configured',
+    database: databaseService.isConfigured ? 'PostgreSQL enabled' : 'Database not configured'
   });
 });
 
